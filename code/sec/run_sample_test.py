@@ -2,13 +2,15 @@
 End-to-end pipeline test with synthetic 8-K press release data.
 
 Generates realistic sample exhibits for ~20 filings from well-known companies,
-then runs parse_guidance.py and build_guidance_panel.py to validate the full
-pipeline. Use this when SEC EDGAR is unreachable (e.g. proxy restrictions).
+then runs parse_guidance.py (regex) or parse_guidance_llm.py (LLM) to validate
+the full pipeline. Use this when SEC EDGAR is unreachable (e.g. proxy restrictions).
 
 Usage:
-    python run_sample_test.py
+    python run_sample_test.py                  # regex parser (default)
+    python run_sample_test.py --parser llm     # LLM parser (requires OPENAI_API_KEY)
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -505,8 +507,19 @@ def create_sample_exhibits() -> pd.DataFrame:
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Run pipeline test with sample data")
+    ap.add_argument(
+        "--parser", choices=["regex", "llm"], default="regex",
+        help="Parser to use: 'regex' (default) or 'llm' (requires OPENAI_API_KEY)",
+    )
+    ap.add_argument(
+        "--model", type=str, default=None,
+        help="Override LLM model (only with --parser llm)",
+    )
+    cli_args = ap.parse_args()
+
     log.info("=" * 60)
-    log.info("Running pipeline end-to-end with sample data (FY 2025)")
+    log.info(f"Running pipeline end-to-end with sample data (FY 2025, parser={cli_args.parser})")
     log.info("=" * 60)
 
     # --- Step 1 (simulated): Create sample 8-K index ---
@@ -540,32 +553,66 @@ def main():
     log.info(f"  Saved sample exhibits ({len(exhibits_df)} records) -> {exhibits_path}")
 
     # --- Step 3: Parse guidance ---
-    log.info("\n--- Step 3: Parsing guidance from exhibits ---")
-    from parse_guidance import extract_guidance_from_text
+    log.info(f"\n--- Step 3: Parsing guidance from exhibits ({cli_args.parser}) ---")
 
     all_guidance = []
     n_with_guidance = 0
 
-    for _, row in exhibits_df.iterrows():
-        filing_meta = {
-            "cik": row["cik"],
-            "company_name": row["company_name"],
-            "accession_number": row["accession_number"],
-            "date_filed": row["date_filed"],
-            "form_type": row["form_type"],
-            "exhibit_url": row["exhibit_url"],
-        }
-        records = extract_guidance_from_text(row["text"], filing_meta)
-        if records:
-            all_guidance.extend(records)
-            n_with_guidance += 1
+    if cli_args.parser == "llm":
+        from parse_guidance_llm import extract_guidance_from_text_llm_sync
+        from openai import OpenAI
+        from config import OPENAI_API_KEY, OPENAI_MODEL
+
+        api_key = OPENAI_API_KEY
+        if not api_key:
+            log.error("OPENAI_API_KEY not set. Export it or add to .env")
+            sys.exit(1)
+
+        model = cli_args.model or OPENAI_MODEL
+        client = OpenAI(api_key=api_key)
+        log.info(f"  Using LLM parser (model={model})")
+
+        for i, (_, row) in enumerate(exhibits_df.iterrows()):
+            filing_meta = {
+                "cik": row["cik"],
+                "company_name": row["company_name"],
+                "accession_number": row["accession_number"],
+                "date_filed": row["date_filed"],
+                "form_type": row["form_type"],
+                "exhibit_url": row["exhibit_url"],
+            }
+            records = extract_guidance_from_text_llm_sync(
+                row["text"], filing_meta, client, model,
+            )
+            if records:
+                all_guidance.extend(records)
+                n_with_guidance += 1
+            log.info(f"    [{i+1}/{len(exhibits_df)}] {row['company_name']}: {len(records)} records")
+
+        client.close()
+    else:
+        from parse_guidance import extract_guidance_from_text
+
+        for _, row in exhibits_df.iterrows():
+            filing_meta = {
+                "cik": row["cik"],
+                "company_name": row["company_name"],
+                "accession_number": row["accession_number"],
+                "date_filed": row["date_filed"],
+                "form_type": row["form_type"],
+                "exhibit_url": row["exhibit_url"],
+            }
+            records = extract_guidance_from_text(row["text"], filing_meta)
+            if records:
+                all_guidance.extend(records)
+                n_with_guidance += 1
 
     log.info(f"  {len(exhibits_df)} exhibits parsed")
     log.info(f"  {n_with_guidance} contained extractable guidance")
     log.info(f"  {len(all_guidance)} total guidance records")
 
     if not all_guidance:
-        log.error("No guidance records extracted! Check regex patterns.")
+        log.error("No guidance records extracted!")
         sys.exit(1)
 
     guidance_df = pd.DataFrame(all_guidance)
@@ -613,13 +660,16 @@ def main():
     )
     log.info(f"  Removed {before - len(guidance_df)} duplicates")
 
-    # Column selection
+    # Column selection -- include LLM-enriched fields if available
     cols = [
         "cik_padded", "ticker", "company_name", "company_name_sec",
         "accession_number", "date_filed", "file_year", "file_quarter", "file_yearq",
         "form_type", "metric", "pdicity", "fiscal_year",
         "val1", "val2", "midpoint", "range_width", "is_range",
         "action", "is_per_share", "sentence", "exhibit_url",
+        # LLM-enriched fields (present when --parser llm)
+        "forecast_metric", "estimate_type", "value_low", "value_high", "value_point",
+        "unit", "direction", "confidence_language", "is_adjusted",
     ]
     cols = [c for c in cols if c in guidance_df.columns]
     panel = guidance_df[cols].sort_values(
@@ -648,8 +698,9 @@ def main():
     log.info("\n" + "=" * 60)
     log.info("SAMPLE OUTPUT (first 20 rows):")
     log.info("=" * 60)
-    preview_cols = ["ticker", "date_filed", "metric", "val1", "val2", "midpoint",
-                    "pdicity", "fiscal_year", "action", "is_range"]
+    preview_cols = ["ticker", "date_filed", "metric", "val1", "val2",
+                    "pdicity", "fiscal_year", "action", "is_range",
+                    "unit", "estimate_type", "is_adjusted", "confidence_language"]
     preview_cols = [c for c in preview_cols if c in panel.columns]
     print(panel[preview_cols].head(20).to_string(index=False))
 
