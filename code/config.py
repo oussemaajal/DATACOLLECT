@@ -16,6 +16,9 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 # ── Credentials (from environment variables) ───────────────────────────
 WRDS_USERNAME = os.getenv("WRDS_USERNAME", "")
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "")  # Required by SEC EDGAR API
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_RATE_LIMIT = int(os.getenv("OPENAI_RATE_LIMIT", "500"))  # requests per minute
 
 # ── Rate limiting defaults ─────────────────────────────────────────────
 SEC_RATE_LIMIT = 10  # requests per second (SEC allows 10/sec)
