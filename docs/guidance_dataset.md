@@ -2,47 +2,69 @@
 
 ## Overview
 
-Panel dataset of management earnings guidance (forecasts) issued by US public firms, sourced from the **I/B/E/S Guidance database on WRDS**. Covers all guidance types (EPS, revenue, EBITDA, etc.) with firm identifiers (PERMNO, GVKEY) for easy linking to CRSP and Compustat.
+Panel dataset of management earnings guidance (forecasts) issued by US public firms, extracted directly from **SEC EDGAR 8-K filings**. No WRDS or I/B/E/S subscription required.
 
-## Source
+The pipeline downloads 8-K press release exhibits, parses guidance statements using regex/NLP, and structures them into a firm-announcement level panel.
 
-- **I/B/E/S Detail Guidance** (`ibes.det_guidance`): Individual management guidance records
-- **I/B/E/S Identifiers** (`ibes.id_sum`): Ticker-to-CUSIP crosswalk
-- **CRSP Stock Names** (`crsp.stocknames`): CUSIP-to-PERMNO mapping
-- **Compustat Security** (`comp.security`): CUSIP-to-GVKEY mapping
+## Data Source
 
-## Coverage
+**SEC EDGAR** -- all data is freely available from the SEC's public filing system.
 
-- **Time period**: 2002--present (I/B/E/S guidance coverage begins ~2002)
-- **Universe**: All US public firms issuing management guidance
-- **Frequency**: Firm-announcement level (one row per guidance issuance)
-- **Guidance types**: EPS, Revenue, EBITDA, FFO, DPS, capex, and others
+| Source | What | URL Pattern |
+|--------|------|-------------|
+| EDGAR Full Index | Quarterly filing indexes | `sec.gov/Archives/edgar/full-index/{YEAR}/QTR{Q}/master.idx` |
+| 8-K Filings | Current reports with earnings press releases | `sec.gov/Archives/edgar/data/{CIK}/{ACCESSION}/` |
+| Company Tickers | CIK-to-ticker mapping | `sec.gov/files/company_tickers.json` |
 
-## How to Build
+## Pipeline
 
-### Step 1: Pull raw data from WRDS
+### Step 1: Build 8-K Filing Index
 
 ```bash
-cd code/wrds
-python guidance.py --start 2002 --end 2025
+cd code/sec
+python fetch_8k_index.py --start 2004 --end 2025
 ```
 
-This creates raw parquet files in `data/raw/guidance/`:
-- `det_guidance_2002_2025.parquet` -- Raw guidance records
-- `ibes_identifiers.parquet` -- I/B/E/S ticker-CUSIP crosswalk
-- `crsp_cusip_permno.parquet` -- CRSP identifier mapping
-- `compustat_cusip_gvkey.parquet` -- Compustat identifier mapping
+Downloads quarterly `master.idx` files from EDGAR, filters for 8-K and 8-K/A filings, saves a combined index. Results cached locally for re-runs.
 
-### Step 2: Build clean panel
+**Output**: `data/raw/guidance/eight_k_index_2004_2025.parquet`
+
+### Step 2: Download Press Release Exhibits
 
 ```bash
-python build_guidance_panel.py --input-tag 2002_2025
+python download_8k_exhibits.py --index eight_k_index_2004_2025.parquet --resume
 ```
 
-This creates:
-- `data/intermediate/guidance_panel_merged_2002_2025.parquet` -- Full merged panel
-- `data/clean/guidance_panel.parquet` -- Final clean dataset
-- `data/clean/guidance_panel_summary.csv` -- Year x measure summary stats
+For each 8-K, fetches the filing index page, identifies EX-99.1 press release exhibits, downloads them, and filters for earnings/guidance-related content. Supports checkpoint/resume for large runs.
+
+**Output**: `data/raw/guidance/eight_k_exhibits.parquet`
+
+### Step 3: Parse Guidance from Text
+
+```bash
+python parse_guidance.py --input eight_k_exhibits.parquet
+```
+
+Extracts structured guidance from press release text using regex patterns for:
+- **Metrics**: EPS, Revenue, Net Income, EBITDA, Operating Income, FFO, Cash Flow, Capex, Gross Margin, Tax Rate
+- **Values**: Point estimates and ranges (e.g., "$1.50 to $1.60", "$10.2 billion")
+- **Periods**: Quarterly (Q1-Q4), annual (FY), semi-annual (H1/H2)
+- **Actions**: Raises, lowers, narrows, reaffirms, initiates, withdraws
+
+**Output**: `data/intermediate/guidance_parsed.parquet`
+
+### Step 4: Build Clean Panel
+
+```bash
+python build_guidance_panel.py
+```
+
+Merges parsed guidance with SEC ticker mapping, adds derived variables, deduplicates, and produces the final panel.
+
+**Output**:
+- `data/clean/guidance_panel.parquet` -- Full panel
+- `data/clean/guidance_panel_summary.csv` -- Year x metric summary
+- `output/guidance_panel_sample.csv` -- 500-row sample for inspection
 
 ## Variable Dictionary
 
@@ -50,81 +72,91 @@ This creates:
 
 | Variable | Description |
 |----------|-------------|
-| `permno` | CRSP permanent security identifier |
-| `permco` | CRSP permanent company identifier |
-| `gvkey` | Compustat Global Company Key |
-| `ticker` | I/B/E/S ticker |
-| `oftic` | Official exchange ticker |
-| `cusip` | 8-digit CUSIP |
-| `cname` | Company name |
+| `cik` | SEC Central Index Key (10-digit, zero-padded) |
+| `ticker` | Stock ticker (from SEC company_tickers.json) |
+| `company_name` | Company name (from 8-K filing) |
+| `company_name_sec` | Company name (from SEC ticker mapping) |
+
+### Filing Info
+
+| Variable | Description |
+|----------|-------------|
+| `accession_number` | SEC filing accession number |
+| `date_filed` | Filing date |
+| `file_year` | Filing calendar year |
+| `file_quarter` | Filing calendar quarter |
+| `file_yearq` | Filing year-quarter string (e.g., "2023Q1") |
+| `form_type` | Filing form type (8-K or 8-K/A) |
 
 ### Guidance Details
 
 | Variable | Description |
 |----------|-------------|
-| `measure` | Guidance metric code (EPS, SAL, EBI, FFO, etc.) |
-| `measure_label` | Human-readable metric name |
-| `pdicity` | Periodicity code (QTR, ANN, SAN) |
-| `pdicity_label` | Human-readable periodicity |
-| `anndats` | Announcement date (when guidance was issued) |
-| `anntims` | Announcement time |
-| `ann_year` | Announcement calendar year |
-| `ann_quarter` | Announcement calendar quarter |
-| `ann_yearq` | Announcement year-quarter string (e.g., "2023Q1") |
-| `statpers` | Statistical period end date (period being forecast) |
-| `stat_year` | Statistical period year |
-| `stat_quarter` | Statistical period quarter |
+| `metric` | Guided metric (EPS, Revenue, Net_Income, EBITDA, etc.) |
+| `pdicity` | Periodicity (Q1-Q4, FY, H1, H2, Unknown) |
+| `fiscal_year` | Fiscal year being guided |
+| `val1` | Lower bound or point estimate |
+| `val2` | Upper bound (same as val1 for point estimates) |
+| `midpoint` | Midpoint of guidance range |
+| `range_width` | Range width (val2 - val1; 0 for point estimates) |
+| `is_range` | Whether guidance is a range (True/False) |
+| `action` | Guidance action (raises, lowers, narrows, reaffirms, initiates, withdraws, issues) |
+| `is_per_share` | Whether values are per-share (vs. aggregate) |
 
-### Guidance Values
+### Source
 
 | Variable | Description |
 |----------|-------------|
-| `val1` | First guidance value (point estimate or range lower bound) |
-| `val2` | Second guidance value (range upper bound; same as val1 for point) |
-| `guidance_mid` | Midpoint of guidance (val1 for point, average of val1/val2 for range) |
-| `range_width` | Width of range (val2 - val1; 0 for point estimates) |
-| `gession` | Guidance form code (1=point, 2=range, 3=open low, 4=open high, 5=confirming, 6=qualitative) |
-| `gession_label` | Human-readable guidance form |
-| `guession` | Guidance sub-type detail |
-| `is_point` | Indicator: 1 if point estimate |
-| `is_range` | Indicator: 1 if range estimate |
+| `sentence` | Source sentence from press release (truncated to 500 chars) |
+| `exhibit_url` | URL of the source exhibit on EDGAR |
 
-### Analyst Context
+## Coverage
 
-| Variable | Description |
-|----------|-------------|
-| `numest` | Number of analyst estimates at time of guidance |
-| `meanest` | Consensus mean analyst estimate |
-| `medest` | Consensus median analyst estimate |
-| `dispersion` | Analyst forecast dispersion |
-| `surprise` | Guidance midpoint minus consensus mean |
-| `surprise_pct` | Surprise scaled by absolute consensus mean |
+- **Time period**: 2004--present (post 8-K reform; SEC mandated 8-K for earnings releases)
+- **Universe**: All US public firms filing 8-Ks with press release exhibits
+- **Guidance types**: EPS, Revenue, EBITDA, Net Income, Operating Income, FFO, Cash Flow, Capex, Gross Margin, Tax Rate
+- **Frequency**: Firm-announcement level
 
-### Actuals
+## Limitations
 
-| Variable | Description |
-|----------|-------------|
-| `actual` | Realized actual value for the guided period |
-| `anndats_act` | Date when actual was announced |
-| `actual_vs_guidance` | Actual minus guidance midpoint (positive = beat guidance) |
+1. **Regex-based extraction**: Not all guidance statements follow standard patterns. Some guidance in unusual formats will be missed. Coverage is best for large-cap firms with standardized press releases.
+2. **False positives**: Some extracted records may be historical results mislabeled as guidance. The `sentence` column allows manual review.
+3. **No analyst consensus**: Unlike I/B/E/S, this dataset does not include concurrent analyst estimates. Merge with analyst forecast data separately if needed.
+4. **8-K only**: Guidance in 10-K/10-Q MD&A sections, conference calls, or investor presentations is not captured.
 
-### Exchange Info
+## Practical Tips
 
-| Variable | Description |
-|----------|-------------|
-| `exchcd` | CRSP exchange code (1=NYSE, 2=AMEX, 3=NASDAQ) |
+```python
+import pandas as pd
 
-## Notes
+panel = pd.read_parquet("data/clean/guidance_panel.parquet")
 
-- **CUSIP matching**: Identifiers are matched using 8-digit CUSIP with date-range validation to ensure the CUSIP was active at the announcement date.
-- **Deduplication**: When multiple CRSP/Compustat matches exist, the primary listing (lowest exchange code) is preferred.
-- **Common filters for research**:
-  - EPS guidance only: `df[df['measure'] == 'EPS']`
-  - Annual guidance: `df[df['pdicity'] == 'ANN']`
-  - Point and range only: `df[df['gession'].isin([1, 2])]`
-  - Exclude confirming/qualitative: `df[~df['gession'].isin([5, 6])]`
+# EPS guidance only
+eps = panel[panel["metric"] == "EPS"]
+
+# Annual guidance only
+annual = panel[panel["pdicity"] == "FY"]
+
+# Range estimates only
+ranges = panel[panel["is_range"] == True]
+
+# Guidance revisions (raised/lowered)
+revisions = panel[panel["action"].isin(["raises", "lowers"])]
+```
+
+## Estimated Runtime
+
+| Step | Typical Time | Bottleneck |
+|------|-------------|------------|
+| Step 1 (Index) | ~10 min | ~80 quarterly index downloads |
+| Step 2 (Exhibits) | ~24-72 hours | Millions of 8-K filings, 10 req/sec |
+| Step 3 (Parse) | ~30-60 min | CPU-bound regex parsing |
+| Step 4 (Panel) | ~5 min | One API call for ticker mapping |
+
+Use `--max-filings` and `--resume` flags in Step 2 to manage large runs.
 
 ## References
 
-- Chuk, E., Matsumoto, D., & Miller, G. (2013). Assessing methods of identifying management forecasts: CIG vs. researcher collected. *Journal of Accounting and Economics*.
+- Anilowski, C., Feng, M., & Skinner, D. (2007). Does earnings guidance affect market returns? The nature and information content of aggregate earnings guidance. *Journal of Accounting and Economics*.
 - Houston, J., Lev, B., & Tucker, J. (2010). To guide or not to guide? Causes and consequences of stopping quarterly earnings guidance. *Contemporary Accounting Research*.
+- SEC 8-K Reform (2004): Expanded list of reportable events, including Item 2.02 (Results of Operations).
